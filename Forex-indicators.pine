@@ -1,0 +1,745 @@
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Forex Sniper v2.1 - XAUUSD & EURUSD confluence signal engine
+// Trend-following pullback entries with higher-timeframe and structure filters
+
+//@version=6
+indicator("Forex Sniper v2", shorttitle="FXSniper2", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// Market detection
+isXAUUSD = str.contains(str.upper(syminfo.ticker), "XAU") or str.contains(str.upper(syminfo.ticker), "GOLD")
+isEURUSD = str.contains(str.upper(syminfo.ticker), "EURUSD") or (str.contains(str.upper(syminfo.ticker), "EUR") and str.contains(str.upper(syminfo.ticker), "USD"))
+isSupported = isXAUUSD or isEURUSD
+marketProfile = isXAUUSD ? "Gold" : isEURUSD ? "EURUSD" : "Generic"
+
+// Adaptive defaults
+atrMultSL = isXAUUSD ? 1.5 : 1.2
+atrMultTP1 = 1.5
+atrMultTP2 = 2.0
+atrMultTP3 = 3.0
+priceFormat = isXAUUSD ? "#.##" : "#.#####"
+pairName = isXAUUSD ? "XAUUSD" : isEURUSD ? "EURUSD" : syminfo.ticker
+
+// Inputs
+grpTrend = "Trend"
+emaFast = input.int(9, "EMA Fast", minval=5, maxval=50, group=grpTrend)
+emaMid = input.int(21, "EMA Mid", minval=10, maxval=100, group=grpTrend)
+emaSlow = input.int(100, "EMA Slow", minval=20, maxval=500, group=grpTrend)
+showEMA = input.bool(true, "Show EMAs", group=grpTrend)
+
+grpMom = "Momentum"
+rsiLen = input.int(14, "RSI Length", minval=5, maxval=50, group=grpMom)
+rsiOB = input.int(70, "RSI Overbought", minval=60, maxval=90, group=grpMom)
+rsiOS = input.int(30, "RSI Oversold", minval=10, maxval=40, group=grpMom)
+macdFast_ = input.int(12, "MACD Fast", minval=5, maxval=30, group=grpMom)
+macdSlow_ = input.int(26, "MACD Slow", minval=15, maxval=50, group=grpMom)
+macdSig_ = input.int(9, "MACD Signal", minval=3, maxval=20, group=grpMom)
+
+grpVola = "Volatility"
+atrLen = input.int(14, "ATR Length", minval=5, maxval=50, group=grpVola)
+bbLen = input.int(20, "Bollinger Length", minval=10, maxval=50, group=grpVola)
+bbMult = input.float(2.0, "Bollinger Multiplier", minval=1.0, maxval=4.0, step=0.1, group=grpVola)
+
+grpMtf = "Higher Timeframe"
+htfTF = input.timeframe("240", "Higher Timeframe", group=grpMtf)
+useAutoHTF = input.bool(true, "Auto Match Higher Timeframe", group=grpMtf, tooltip="Maps each chart timeframe to a more natural higher timeframe so lower charts are not over-filtered and higher charts do not self-reference.")
+
+grpSignal = "Signals"
+minConfluence = input.int(4, "Minimum Confluence", minval=2, maxval=6, group=grpSignal, tooltip="Signal score needed to trigger. The model uses 5 core checks plus 1 candle bonus.")
+minRR = input.float(1.5, "Minimum Estimated R:R", minval=1.0, maxval=5.0, step=0.1, group=grpSignal, tooltip="Signals are filtered by estimated room to the next structure target.")
+enableTierBSignals = input.bool(true, "Enable Tier-B Expansion Signals", group=grpSignal, tooltip="Adds extra entries in strong directional conditions with softer score requirements.")
+tierBMinConfluence = input.int(3, "Tier-B Minimum Confluence", minval=2, maxval=6, group=grpSignal)
+tierBMinRR = input.float(1.1, "Tier-B Minimum Estimated R:R", minval=1.0, maxval=3.0, step=0.1, group=grpSignal)
+useSoftPenaltyScoring = input.bool(true, "Tier-B Use Soft Penalty Scoring", group=grpSignal, tooltip="Instead of blocking signals for weak ADX or compressed BB, Tier-B subtracts points.")
+pullbackAtrMult = input.float(0.45, "Pullback ATR Distance", minval=0.1, maxval=1.5, step=0.05, group=grpSignal)
+pullbackLookback = input.int(3, "Pullback Lookback Bars", minval=1, maxval=10, group=grpSignal)
+swingLen = input.int(5, "Swing Length", minval=2, maxval=20, group=grpSignal)
+useHTFFilter = input.bool(true, "Require HTF Alignment", group=grpSignal)
+useAdxFilter = input.bool(true, "Use ADX Trend Filter", group=grpSignal)
+adxLen = input.int(14, "ADX Length", minval=5, maxval=50, group=grpSignal)
+adxSmooth = input.int(14, "ADX Smoothing", minval=5, maxval=50, group=grpSignal)
+minADX = input.float(18.0, "Minimum ADX", minval=5.0, maxval=50.0, step=0.5, group=grpSignal)
+useSessionFilter = input.bool(false, "Filter Signals By Custom Session", group=grpSignal)
+requireBreakoutTrigger = input.bool(true, "Require Breakout Trigger", group=grpSignal, tooltip="Longs require a close above the prior bar high after the pullback. Shorts require a close below the prior bar low.")
+allowReclaimEntry = input.bool(true, "Allow Liquidity Reclaim Entries", group=grpSignal, tooltip="Allows entries after a sweep of recent lows/highs that gets reclaimed.")
+reclaimLookback = input.int(5, "Reclaim Sweep Lookback Bars", minval=2, maxval=20, group=grpSignal)
+reclaimSweepAtr = input.float(0.15, "Reclaim Sweep Distance (ATR)", minval=0.05, maxval=1.0, step=0.05, group=grpSignal)
+allowContinuationEntry = input.bool(true, "Allow Continuation Entries", group=grpSignal, tooltip="Adds trend-continuation entries after shallow pullbacks into EMA fast.")
+continuationTouchAtr = input.float(0.25, "Continuation Touch Distance (ATR)", minval=0.05, maxval=1.0, step=0.05, group=grpSignal)
+continuationNeedsBreakout = input.bool(false, "Continuation Requires Breakout", group=grpSignal)
+cooldownBars = input.int(8, "Same-Direction Cooldown Bars", minval=0, maxval=100, group=grpSignal)
+useDynamicCooldown = input.bool(true, "Use Dynamic Cooldown", group=grpSignal, tooltip="Reduces cooldown during strong 4H-aligned trend phases to catch more setups.")
+strongTrendCooldownBars = input.int(3, "Strong Trend Cooldown Bars", minval=0, maxval=50, group=grpSignal)
+minBBWidthRatio = input.float(0.85, "Min BB Width vs Baseline", minval=0.5, maxval=1.5, step=0.05, group=grpSignal, tooltip="Blocks signals when current Bollinger width is too compressed compared with its recent average.")
+maxSwingRiskATR = input.float(2.5, "Max Swing Stop Distance (ATR)", minval=0.5, maxval=10.0, step=0.1, group=grpSignal, tooltip="If the latest swing stop is wider than this ATR multiple, the script falls back to the ATR stop.")
+showDash = input.bool(true, "Show Dashboard", group=grpSignal)
+
+grpVisual = "Visuals"
+showTPSL = input.bool(true, "Show Signal Guides", group=grpVisual)
+guideProjectionBars = input.int(22, "Guide Projection Bars", minval=8, maxval=80, group=grpVisual)
+guideLifeBars = input.int(60, "Guide Lifetime Bars", minval=10, maxval=300, group=grpVisual, tooltip="Keeps the latest signal guide visible for this many bars.")
+showRiskRewardZones = input.bool(true, "Show Risk/Reward Zones", group=grpVisual)
+showChartTags = input.bool(true, "Show In-Chart Tags", group=grpVisual)
+showNextBiasPanel = input.bool(true, "Show Next Bias Panel", group=grpVisual)
+chartTagOffsetBars = input.int(2, "In-Chart Tag Offset", minval=1, maxval=12, group=grpVisual)
+rightTagOffsetBars = input.int(6, "Right Tag Offset", minval=3, maxval=20, group=grpVisual)
+
+grpSession = "Session"
+sessionStart = input.int(22, "Session Start (MYT)", minval=0, maxval=23, group=grpSession)
+sessionEnd = input.int(0, "Session End (MYT)", minval=0, maxval=23, group=grpSession)
+showSession = input.bool(true, "Highlight Custom Session", group=grpSession)
+showAllSess = input.bool(true, "Show Major Sessions", group=grpSession)
+
+grpColor = "Colors"
+colBull = input.color(#00E676, "Bullish Color", group=grpColor)
+colBear = input.color(#FF1744, "Bearish Color", group=grpColor)
+colNeutral = input.color(#B0BEC5, "Neutral Color", group=grpColor)
+colWarn = input.color(#FFD740, "Warning Color", group=grpColor)
+colSession = input.color(#1565C0, "Session Color", group=grpColor)
+
+// Session detection
+mytHour = hour(time, "Asia/Kuala_Lumpur")
+inTradingSession = sessionEnd > sessionStart ? (mytHour >= sessionStart and mytHour < sessionEnd) : (mytHour >= sessionStart or mytHour < sessionEnd)
+
+inLondon = not na(time(timeframe.period, "0800-1600", "Europe/London"))
+inNewYork = not na(time(timeframe.period, "0800-1700", "America/New_York"))
+inTokyo = not na(time(timeframe.period, "0900-1500", "Asia/Tokyo"))
+
+sessionBG = showSession and inTradingSession ? color.new(colSession, 88) : na
+londonBG = showAllSess and inLondon and not inTradingSession ? color.new(#FF9800, 95) : na
+nyBG = showAllSess and inNewYork and not inTradingSession ? color.new(#4CAF50, 95) : na
+tokyoBG = showAllSess and inTokyo and not inTradingSession ? color.new(#42A5F5, 96) : na
+
+bgcolor(sessionBG, title="Custom Session")
+bgcolor(londonBG, title="London Session")
+bgcolor(nyBG, title="New York Session")
+bgcolor(tokyoBG, title="Tokyo Session")
+
+// Core calculations
+emaFastLine = ta.ema(close, emaFast)
+emaMidLine = ta.ema(close, emaMid)
+emaSlowLine = ta.ema(close, emaSlow)
+
+rsiVal = ta.rsi(close, rsiLen)
+rsiRising = rsiVal > rsiVal[1]
+rsiFalling = rsiVal < rsiVal[1]
+
+[macdLine, signalLine, histLine] = ta.macd(close, macdFast_, macdSlow_, macdSig_)
+macdCrossUp = ta.crossover(macdLine, signalLine)
+macdCrossDown = ta.crossunder(macdLine, signalLine)
+histTurnUp = histLine > histLine[1] and histLine[1] <= histLine[2]
+histTurnDown = histLine < histLine[1] and histLine[1] >= histLine[2]
+
+atrVal = ta.atr(atrLen)
+[bbMid, bbUp, bbLow] = ta.bb(close, bbLen, bbMult)
+bbWidthPct = bbMid != 0 ? (bbUp - bbLow) / bbMid * 100 : 0.0
+bbWidthBaseline = ta.sma(bbWidthPct, 20)
+
+[plusDI, minusDI, adxVal] = ta.dmi(adxLen, adxSmooth)
+dmiBull = plusDI >= minusDI
+dmiBear = minusDI > plusDI
+
+sarVal = ta.sar(0.02, 0.02, 0.2)
+
+chartTfSec = timeframe.in_seconds(timeframe.period)
+autoHtfTF = chartTfSec <= 300 ? "15" : chartTfSec <= 900 ? "60" : chartTfSec <= 3600 ? "240" : chartTfSec <= 14400 ? "D" : chartTfSec <= 86400 ? "W" : "M"
+autoHtfLabel = chartTfSec <= 300 ? "15 Minute" : chartTfSec <= 900 ? "1 Hour" : chartTfSec <= 3600 ? "4 Hour" : chartTfSec <= 14400 ? "Daily" : chartTfSec <= 86400 ? "Weekly" : "Monthly"
+activeHtfTF = useAutoHTF ? autoHtfTF : htfTF
+activeHtfLabel = useAutoHTF ? autoHtfLabel : htfTF
+
+htfEma21 = request.security(syminfo.tickerid, activeHtfTF, ta.ema(close, 21), lookahead=barmerge.lookahead_off)
+htfEma50 = request.security(syminfo.tickerid, activeHtfTF, ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+htfClose = request.security(syminfo.tickerid, activeHtfTF, close, lookahead=barmerge.lookahead_off)
+htfBull = htfClose > htfEma21 and htfEma21 > htfEma50
+htfBear = htfClose < htfEma21 and htfEma21 < htfEma50
+
+swHigh = ta.pivothigh(high, swingLen, swingLen)
+swLow = ta.pivotlow(low, swingLen, swingLen)
+var float recentSwLow = na
+var float recentSwHigh = na
+if not na(swLow)
+    recentSwLow := swLow
+if not na(swHigh)
+    recentSwHigh := swHigh
+
+plot(showEMA ? emaFastLine : na, "EMA Fast", color=color.new(#42A5F5, 20), linewidth=1)
+plot(showEMA ? emaMidLine : na, "EMA Mid", color=color.new(#FF9800, 20), linewidth=1)
+plot(showEMA ? emaSlowLine : na, "EMA Slow", color=color.new(#E040FB, 10), linewidth=2)
+
+bbUpPlot = plot(bbUp, "BB Upper", color=color.new(#FF5252, 50), linewidth=1)
+bbLowPlot = plot(bbLow, "BB Lower", color=color.new(#FF5252, 50), linewidth=1)
+fill(bbUpPlot, bbLowPlot, color=color.new(#FF5252, 92), title="BB Fill")
+plot(sarVal, "Parabolic SAR", style=plot.style_circles, color=color.new(#2962FF, 0), linewidth=1)
+
+// Candle structure
+bodySize = math.abs(close - open)
+upperWick = high - math.max(close, open)
+lowerWick = math.min(close, open) - low
+totalRange = math.max(high - low, syminfo.mintick)
+avgBody = ta.sma(bodySize, 14)
+
+bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1] and bodySize > avgBody * 0.9
+bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1] and bodySize > avgBody * 0.9
+hammer = lowerWick > bodySize * 2 and upperWick <= bodySize * 0.6 and close > open
+shootingStar = upperWick > bodySize * 2 and lowerWick <= bodySize * 0.6 and close < open
+bullPinBar = lowerWick > totalRange * 0.55 and bodySize < totalRange * 0.35 and close >= open
+bearPinBar = upperWick > totalRange * 0.55 and bodySize < totalRange * 0.35 and close <= open
+
+bullCandle = bullEngulf or hammer or bullPinBar
+bearCandle = bearEngulf or shootingStar or bearPinBar
+
+// Trend and pullback filters
+emaMidSlope = emaMidLine - emaMidLine[3]
+emaSlowSlope = emaSlowLine - emaSlowLine[5]
+localBullTrend = close > emaSlowLine and emaMidLine > emaSlowLine and emaMidSlope > 0 and emaSlowSlope >= 0
+localBearTrend = close < emaSlowLine and emaMidLine < emaSlowLine and emaMidSlope < 0 and emaSlowSlope <= 0
+
+pullbackZone = atrVal * pullbackAtrMult
+lowestPullbackLow = ta.lowest(low, pullbackLookback)
+highestPullbackHigh = ta.highest(high, pullbackLookback)
+pullbackLong = lowestPullbackLow <= emaMidLine + pullbackZone and lowestPullbackLow >= emaSlowLine - pullbackZone and close > emaMidLine
+pullbackShort = highestPullbackHigh >= emaMidLine - pullbackZone and highestPullbackHigh <= emaSlowLine + pullbackZone and close < emaMidLine
+
+breakoutLong = close > high[1]
+breakoutShort = close < low[1]
+
+priorLiquidityLow = ta.lowest(low[1], reclaimLookback)
+priorLiquidityHigh = ta.highest(high[1], reclaimLookback)
+reclaimSweepLong = not na(priorLiquidityLow) and low < priorLiquidityLow - atrVal * reclaimSweepAtr
+reclaimSweepShort = not na(priorLiquidityHigh) and high > priorLiquidityHigh + atrVal * reclaimSweepAtr
+reclaimLong = reclaimSweepLong and close > priorLiquidityLow and close > open
+reclaimShort = reclaimSweepShort and close < priorLiquidityHigh and close < open
+
+continuationLong = low <= emaFastLine + atrVal * continuationTouchAtr and close > emaFastLine and emaFastLine > emaMidLine and emaMidLine >= emaSlowLine
+continuationShort = high >= emaFastLine - atrVal * continuationTouchAtr and close < emaFastLine and emaFastLine < emaMidLine and emaMidLine <= emaSlowLine
+
+pullbackTriggerLong = pullbackLong and (not requireBreakoutTrigger or breakoutLong)
+pullbackTriggerShort = pullbackShort and (not requireBreakoutTrigger or breakoutShort)
+reclaimTriggerLong = allowReclaimEntry and reclaimLong and (not requireBreakoutTrigger or breakoutLong)
+reclaimTriggerShort = allowReclaimEntry and reclaimShort and (not requireBreakoutTrigger or breakoutShort)
+continuationTriggerLong = allowContinuationEntry and continuationLong and (not continuationNeedsBreakout or breakoutLong)
+continuationTriggerShort = allowContinuationEntry and continuationShort and (not continuationNeedsBreakout or breakoutShort)
+aggressiveLongTrigger = pullbackTriggerLong or reclaimTriggerLong or continuationTriggerLong
+aggressiveShortTrigger = pullbackTriggerShort or reclaimTriggerShort or continuationTriggerShort
+
+sessionAllowed = not useSessionFilter or inTradingSession
+trendRegimeOk = not useAdxFilter or adxVal >= minADX
+bbWidthOk = na(bbWidthBaseline) or bbWidthPct >= bbWidthBaseline * minBBWidthRatio
+htfLongAllowed = not useHTFFilter or htfBull
+htfShortAllowed = not useHTFFilter or htfBear
+
+// Signal scoring
+buy_c1 = localBullTrend
+buy_c2 = emaFastLine > emaMidLine and emaMidSlope > 0
+buy_c3 = rsiVal >= 48 and rsiVal < rsiOB and rsiRising
+buy_c4 = ((histLine > 0 and histLine > histLine[1]) or macdCrossUp or histTurnUp) and dmiBull
+buy_c5 = pullbackTriggerLong
+
+sell_c1 = localBearTrend
+sell_c2 = emaFastLine < emaMidLine and emaMidSlope < 0
+sell_c3 = rsiVal <= 52 and rsiVal > rsiOS and rsiFalling
+sell_c4 = ((histLine < 0 and histLine < histLine[1]) or macdCrossDown or histTurnDown) and dmiBear
+sell_c5 = pullbackTriggerShort
+
+buyCount = 0
+buyCount += buy_c1 ? 1 : 0
+buyCount += buy_c2 ? 1 : 0
+buyCount += buy_c3 ? 1 : 0
+buyCount += buy_c4 ? 1 : 0
+buyCount += buy_c5 ? 1 : 0
+
+sellCount = 0
+sellCount += sell_c1 ? 1 : 0
+sellCount += sell_c2 ? 1 : 0
+sellCount += sell_c3 ? 1 : 0
+sellCount += sell_c4 ? 1 : 0
+sellCount += sell_c5 ? 1 : 0
+
+buyBonus = bullCandle ? 1 : 0
+sellBonus = bearCandle ? 1 : 0
+buyEntryBonus = (reclaimTriggerLong or continuationTriggerLong) ? 1 : 0
+sellEntryBonus = (reclaimTriggerShort or continuationTriggerShort) ? 1 : 0
+
+// Trade state
+var int tradeDir = 0
+var float entryPrice = na
+var float slPrice = na
+var float tp1Price = na
+var float tp2Price = na
+var float tp3Price = na
+var float rr = na
+var int entryBarIndex = na
+var float estTarget = na
+var int lastBuyBar = na
+var int lastSellBar = na
+var int displayDir = 0
+var bool safeTpHit = false
+var bool tp1HitFlag = false
+var int displayBarIndex = na
+var float displayEntryPrice = na
+var float displaySLPrice = na
+var float displayTP1Price = na
+var float displayTP2Price = na
+var float displayTP3Price = na
+var float displayRR = na
+
+f_buyStop(price) =>
+    baseStop = price - atrVal * atrMultSL
+    swingStop = not na(recentSwLow) and recentSwLow < price ? recentSwLow - atrVal * 0.2 : na
+    swingRisk = not na(swingStop) ? price - swingStop : na
+    not na(swingRisk) and swingRisk <= atrVal * maxSwingRiskATR ? swingStop : baseStop
+
+f_sellStop(price) =>
+    baseStop = price + atrVal * atrMultSL
+    swingStop = not na(recentSwHigh) and recentSwHigh > price ? recentSwHigh + atrVal * 0.2 : na
+    swingRisk = not na(swingStop) ? swingStop - price : na
+    not na(swingRisk) and swingRisk <= atrVal * maxSwingRiskATR ? swingStop : baseStop
+
+f_buyTarget(price) =>
+    swingTarget = not na(recentSwHigh) and recentSwHigh > price ? recentSwHigh : na
+    bandTarget = bbUp > price ? bbUp : na
+    not na(swingTarget) ? swingTarget : not na(bandTarget) ? bandTarget : price + atrVal * atrMultTP2
+
+f_sellTarget(price) =>
+    swingTarget = not na(recentSwLow) and recentSwLow < price ? recentSwLow : na
+    bandTarget = bbLow < price ? bbLow : na
+    not na(swingTarget) ? swingTarget : not na(bandTarget) ? bandTarget : price - atrVal * atrMultTP2
+
+f_calcRR_buy(price) =>
+    sl = f_buyStop(price)
+    target = f_buyTarget(price)
+    risk = price - sl
+    reward = target - price
+    risk > 0 and reward > 0 ? reward / risk : 0.0
+
+f_calcRR_sell(price) =>
+    sl = f_sellStop(price)
+    target = f_sellTarget(price)
+    risk = sl - price
+    reward = price - target
+    risk > 0 and reward > 0 ? reward / risk : 0.0
+
+buyTotal = buyCount + buyBonus
+sellTotal = sellCount + sellBonus
+buyTotalExpanded = buyTotal + buyEntryBonus
+sellTotalExpanded = sellTotal + sellEntryBonus
+buyRR = f_calcRR_buy(close)
+sellRR = f_calcRR_sell(close)
+
+buyFiltersOk = sessionAllowed and trendRegimeOk and bbWidthOk and htfLongAllowed
+sellFiltersOk = sessionAllowed and trendRegimeOk and bbWidthOk and htfShortAllowed
+buyTierBFiltersOk = sessionAllowed and htfLongAllowed
+sellTierBFiltersOk = sessionAllowed and htfShortAllowed
+
+buyPenalty = 0
+buyPenalty += useSoftPenaltyScoring and useAdxFilter and adxVal < minADX ? 1 : 0
+buyPenalty += useSoftPenaltyScoring and not bbWidthOk ? 1 : 0
+sellPenalty = 0
+sellPenalty += useSoftPenaltyScoring and useAdxFilter and adxVal < minADX ? 1 : 0
+sellPenalty += useSoftPenaltyScoring and not bbWidthOk ? 1 : 0
+
+buyAggressiveScore = buyTotalExpanded - buyPenalty
+sellAggressiveScore = sellTotalExpanded - sellPenalty
+
+rawBuySignalA = buyFiltersOk and pullbackTriggerLong and buyTotal >= minConfluence and buyRR >= minRR and barstate.isconfirmed
+rawSellSignalA = sellFiltersOk and pullbackTriggerShort and sellTotal >= minConfluence and sellRR >= minRR and barstate.isconfirmed
+rawBuySignalB = enableTierBSignals and buyTierBFiltersOk and aggressiveLongTrigger and buyAggressiveScore >= tierBMinConfluence and buyRR >= tierBMinRR and barstate.isconfirmed
+rawSellSignalB = enableTierBSignals and sellTierBFiltersOk and aggressiveShortTrigger and sellAggressiveScore >= tierBMinConfluence and sellRR >= tierBMinRR and barstate.isconfirmed
+
+biasThreshold = math.max(minConfluence - 1, 3)
+bullBiasWatch = buyFiltersOk and buyTotal >= biasThreshold
+bearBiasWatch = sellFiltersOk and sellTotal >= biasThreshold
+nextBiasDir = bullBiasWatch and not bearBiasWatch ? 1 : bearBiasWatch and not bullBiasWatch ? -1 : buyFiltersOk and sellFiltersOk and buyTotal > sellTotal ? 1 : buyFiltersOk and sellFiltersOk and sellTotal > buyTotal ? -1 : htfBull and emaFastLine > emaMidLine ? 1 : htfBear and emaFastLine < emaMidLine ? -1 : 0
+nextBiasReady = nextBiasDir == 1 ? (rawBuySignalA or rawBuySignalB) : nextBiasDir == -1 ? (rawSellSignalA or rawSellSignalB) : false
+nextBiasText = nextBiasDir == 1 ? (nextBiasReady ? "Bullish Ready" : "Bullish Watch") : nextBiasDir == -1 ? (nextBiasReady ? "Bearish Ready" : "Bearish Watch") : "Neutral"
+nextBiasColor = nextBiasDir == 1 ? color.new(#59D36A, 0) : nextBiasDir == -1 ? color.new(#FF6B6B, 0) : color.new(#A9B4C5, 0)
+nextBiasBg = nextBiasDir == 1 ? color.new(#10281C, 8) : nextBiasDir == -1 ? color.new(#34131A, 8) : color.new(#161C28, 8)
+nextBiasDetail = nextBiasDir == 1 ? "Bull " + str.tostring(buyTotal) + "/6 | RR " + str.tostring(buyRR, "#.##") : nextBiasDir == -1 ? "Bear " + str.tostring(sellTotal) + "/6 | RR " + str.tostring(sellRR, "#.##") : "Waiting for full confluence"
+
+strongBullPhase = htfBull and emaFastLine > emaMidLine and emaMidSlope > 0 and dmiBull
+strongBearPhase = htfBear and emaFastLine < emaMidLine and emaMidSlope < 0 and dmiBear
+activeBuyCooldownBars = useDynamicCooldown ? (strongBullPhase ? strongTrendCooldownBars : cooldownBars) : cooldownBars
+activeSellCooldownBars = useDynamicCooldown ? (strongBearPhase ? strongTrendCooldownBars : cooldownBars) : cooldownBars
+buyCooldownOk = na(lastBuyBar) or bar_index - lastBuyBar > activeBuyCooldownBars
+sellCooldownOk = na(lastSellBar) or bar_index - lastSellBar > activeSellCooldownBars
+
+buySignalA = rawBuySignalA and not rawSellSignalA and tradeDir != 1 and buyCooldownOk
+sellSignalA = rawSellSignalA and not rawBuySignalA and tradeDir != -1 and sellCooldownOk
+buySignalB = not buySignalA and rawBuySignalB and not rawSellSignalA and not rawSellSignalB and tradeDir != 1 and buyCooldownOk
+sellSignalB = not sellSignalA and rawSellSignalB and not rawBuySignalA and not rawBuySignalB and tradeDir != -1 and sellCooldownOk
+buySignal = buySignalA or buySignalB
+sellSignal = sellSignalA or sellSignalB
+
+buyStrength = buySignalA ? (buyTotal >= 5 and buyRR >= minRR + 0.3 ? 2 : 1) : buySignalB ? 0 : -1
+sellStrength = sellSignalA ? (sellTotal >= 5 and sellRR >= minRR + 0.3 ? 2 : 1) : sellSignalB ? 0 : -1
+
+if buySignal
+    tradeDir := 1
+    entryPrice := close
+    entryBarIndex := bar_index
+    slPrice := f_buyStop(entryPrice)
+    riskAmt = entryPrice - slPrice
+    tp1Price := entryPrice + riskAmt * atrMultTP1
+    tp2Price := entryPrice + riskAmt * atrMultTP2
+    tp3Price := entryPrice + riskAmt * atrMultTP3
+    estTarget := f_buyTarget(entryPrice)
+    rr := buyRR
+    lastBuyBar := bar_index
+    displayDir := 1
+    displayBarIndex := bar_index
+    displayEntryPrice := entryPrice
+    displaySLPrice := slPrice
+    displayTP1Price := tp1Price
+    displayTP2Price := tp2Price
+    displayTP3Price := tp3Price
+    displayRR := rr
+    safeTpHit := false
+    tp1HitFlag := false
+
+if sellSignal
+    tradeDir := -1
+    entryPrice := close
+    entryBarIndex := bar_index
+    slPrice := f_sellStop(entryPrice)
+    riskAmt = slPrice - entryPrice
+    tp1Price := entryPrice - riskAmt * atrMultTP1
+    tp2Price := entryPrice - riskAmt * atrMultTP2
+    tp3Price := entryPrice - riskAmt * atrMultTP3
+    estTarget := f_sellTarget(entryPrice)
+    rr := sellRR
+    lastSellBar := bar_index
+    displayDir := -1
+    displayBarIndex := bar_index
+    displayEntryPrice := entryPrice
+    displaySLPrice := slPrice
+    displayTP1Price := tp1Price
+    displayTP2Price := tp2Price
+    displayTP3Price := tp3Price
+    displayRR := rr
+    safeTpHit := false
+    tp1HitFlag := false
+
+tradeActiveBar = not na(entryBarIndex) and bar_index > entryBarIndex
+
+// TP hit detection
+safeTpNewHit = not safeTpHit and tradeActiveBar and not na(tp1Price) and ((tradeDir == 1 and high >= tp1Price) or (tradeDir == -1 and low <= tp1Price))
+tp1NewHit = not tp1HitFlag and tradeActiveBar and not na(tp2Price) and ((tradeDir == 1 and high >= tp2Price) or (tradeDir == -1 and low <= tp2Price))
+safeTpPlotPrice = safeTpNewHit ? tp1Price : na
+tp1PlotPrice = tp1NewHit ? tp2Price : na
+if safeTpNewHit
+    safeTpHit := true
+if tp1NewHit
+    tp1HitFlag := true
+longStopped = tradeDir == 1 and tradeActiveBar and not na(slPrice) and low <= slPrice
+longTargetHit = tradeDir == 1 and tradeActiveBar and not na(tp2Price) and high >= tp2Price
+longTrendBroken = tradeDir == 1 and tradeActiveBar and close < emaMidLine and close < emaSlowLine and emaFastLine < emaMidLine
+
+shortStopped = tradeDir == -1 and tradeActiveBar and not na(slPrice) and high >= slPrice
+shortTargetHit = tradeDir == -1 and tradeActiveBar and not na(tp2Price) and low <= tp2Price
+shortTrendBroken = tradeDir == -1 and tradeActiveBar and close > emaMidLine and close > emaSlowLine and emaFastLine > emaMidLine
+
+if longStopped or longTargetHit or longTrendBroken
+    tradeDir := 0
+    entryPrice := na
+    slPrice := na
+    tp1Price := na
+    tp2Price := na
+    tp3Price := na
+    rr := na
+    entryBarIndex := na
+    estTarget := na
+
+if shortStopped or shortTargetHit or shortTrendBroken
+    tradeDir := 0
+    entryPrice := na
+    slPrice := na
+    tp1Price := na
+    tp2Price := na
+    tp3Price := na
+    rr := na
+    entryBarIndex := na
+    estTarget := na
+
+// TP hit markers
+plotshape(safeTpPlotPrice, "Safe TP Hit", style=shape.xcross, location=location.absolute, color=color.new(#2F67FF, 0), size=size.small, text="Safe TP", textcolor=color.new(#2F67FF, 0))
+plotshape(tp1PlotPrice, "TP 1 Hit", style=shape.xcross, location=location.absolute, color=color.new(#5ED36A, 0), size=size.small, text="TP 1", textcolor=color.new(#5ED36A, 0))
+
+// Entry markers
+smartBuy = buySignal and buyStrength == 2
+normalBuy = buySignal and buyStrength == 1
+scoutBuy = buySignal and buyStrength == 0
+smartSell = sellSignal and sellStrength == 2
+normalSell = sellSignal and sellStrength == 1
+scoutSell = sellSignal and sellStrength == 0
+
+plotshape(smartBuy ? low : na, "Smart Buy", style=shape.labelup, location=location.belowbar, color=color.new(colBull, 0), size=size.normal, text="Smart\nBuy", textcolor=color.black)
+plotshape(normalBuy ? low : na, "Buy", style=shape.labelup, location=location.belowbar, color=color.new(colBull, 12), size=size.small, text="Buy", textcolor=color.black)
+plotshape(scoutBuy ? low : na, "Scout Buy", style=shape.labelup, location=location.belowbar, color=color.new(colBull, 38), size=size.tiny, text="Scout\nBuy", textcolor=color.black)
+plotshape(smartSell ? high : na, "Smart Sell", style=shape.labeldown, location=location.abovebar, color=color.new(#E040FB, 0), size=size.normal, text="Smart\nSell", textcolor=color.white)
+plotshape(normalSell ? high : na, "Sell", style=shape.labeldown, location=location.abovebar, color=color.new(#E040FB, 12), size=size.small, text="Sell", textcolor=color.white)
+plotshape(scoutSell ? high : na, "Scout Sell", style=shape.labeldown, location=location.abovebar, color=color.new(#E040FB, 38), size=size.tiny, text="Scout\nSell", textcolor=color.white)
+
+// Signal guide overlay
+var line entryGlowLine = na
+var line slGlowLine = na
+var line tp1GlowLine = na
+var line tp2GlowLine = na
+var line tp3GlowLine = na
+var line entryLine = na
+var line slLine = na
+var line tp1Line = na
+var line tp2Line = na
+var line tp3Line = na
+var box riskBox = na
+var box rewardBox = na
+var box runnerBox = na
+var line entryTagLine = na
+var line slTagLine = na
+var line tp1TagLine = na
+var line tp2TagLine = na
+var line tp3TagLine = na
+var label entryLbl = na
+var label slLbl = na
+var label tp1Lbl = na
+var label tp2Lbl = na
+var label tp3Lbl = na
+var label guideHeaderLbl = na
+var label entryTagLbl = na
+var label slTagLbl = na
+var label tp1TagLbl = na
+var label tp2TagLbl = na
+var label tp3TagLbl = na
+var label entryDotLbl = na
+var label slDotLbl = na
+var label tp1DotLbl = na
+var label tp2DotLbl = na
+var label tp3DotLbl = na
+
+if barstate.islast
+    line.delete(entryGlowLine)
+    line.delete(slGlowLine)
+    line.delete(tp1GlowLine)
+    line.delete(tp2GlowLine)
+    line.delete(tp3GlowLine)
+    line.delete(entryLine)
+    line.delete(slLine)
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+    line.delete(tp3Line)
+    line.delete(entryTagLine)
+    line.delete(slTagLine)
+    line.delete(tp1TagLine)
+    line.delete(tp2TagLine)
+    line.delete(tp3TagLine)
+    box.delete(riskBox)
+    box.delete(rewardBox)
+    box.delete(runnerBox)
+    label.delete(entryLbl)
+    label.delete(slLbl)
+    label.delete(tp1Lbl)
+    label.delete(tp2Lbl)
+    label.delete(tp3Lbl)
+    label.delete(guideHeaderLbl)
+    label.delete(entryTagLbl)
+    label.delete(slTagLbl)
+    label.delete(tp1TagLbl)
+    label.delete(tp2TagLbl)
+    label.delete(tp3TagLbl)
+    label.delete(entryDotLbl)
+    label.delete(slDotLbl)
+    label.delete(tp1DotLbl)
+    label.delete(tp2DotLbl)
+    label.delete(tp3DotLbl)
+
+    displayAge = not na(displayBarIndex) ? bar_index - displayBarIndex : na
+    showGuide = showTPSL and displayDir != 0 and not na(displayAge) and displayAge <= guideLifeBars
+    if showGuide
+        lineStart = displayBarIndex
+        lineEnd = math.max(bar_index + guideProjectionBars, lineStart + guideProjectionBars)
+        rightTagX = int(math.min(bar_index + rightTagOffsetBars, lineEnd))
+        tpLabelX = rightTagX
+        entryLineColor = color.new(#D0891F, 0)
+        stopLineColor = color.new(#FF6B6B, 0)
+        tp1LineColor = color.new(#2F67FF, 0)
+        tp2LineColor = color.new(#5ED36A, 0)
+        tp3LineColor = color.new(#6BEA72, 0)
+        entryGlowColor = color.new(#F7B733, 76)
+        stopGlowColor = color.new(#FF6B6B, 78)
+        tp1GlowColor = color.new(#2F67FF, 80)
+        tp2GlowColor = color.new(#5ED36A, 80)
+        tp3GlowColor = color.new(#6BEA72, 82)
+        rewardZoneColor = color.new(tp2LineColor, 90)
+        runnerZoneColor = color.new(#B000B5, 93)
+        riskTop = math.max(displayEntryPrice, displaySLPrice)
+        riskBottom = math.min(displayEntryPrice, displaySLPrice)
+        rewardTop = math.max(displayEntryPrice, displayTP2Price)
+        rewardBottom = math.min(displayEntryPrice, displayTP2Price)
+        runnerTop = math.max(displayTP2Price, displayTP3Price)
+        runnerBottom = math.min(displayTP2Price, displayTP3Price)
+        tagBaseX = bar_index + chartTagOffsetBars
+        entryTagX = int(math.min(tagBaseX + 1, lineEnd - 6))
+        slTagX = int(math.min(tagBaseX + 3, lineEnd - 4))
+        tpConnectorX = int(math.min(tpLabelX - 1, lineEnd - 1))
+
+        if showRiskRewardZones
+            riskBox := box.new(lineStart, riskTop, lineEnd, riskBottom, bgcolor=color.new(#6A001A, 92), border_color=color.new(#FF6B6B, 100))
+            rewardBox := box.new(lineStart, rewardTop, lineEnd, rewardBottom, bgcolor=rewardZoneColor, border_color=color.new(colBull, 100))
+            runnerBox := box.new(lineStart, runnerTop, lineEnd, runnerBottom, bgcolor=runnerZoneColor, border_color=color.new(#D946EF, 100))
+
+        entryGlowLine := line.new(lineStart, displayEntryPrice, lineEnd, displayEntryPrice, color=entryGlowColor, style=line.style_solid, width=8)
+        slGlowLine := line.new(lineStart, displaySLPrice, lineEnd, displaySLPrice, color=stopGlowColor, style=line.style_solid, width=8)
+        tp1GlowLine := line.new(lineStart, displayTP1Price, lineEnd, displayTP1Price, color=tp1GlowColor, style=line.style_solid, width=7)
+        tp2GlowLine := line.new(lineStart, displayTP2Price, lineEnd, displayTP2Price, color=tp2GlowColor, style=line.style_solid, width=7)
+        tp3GlowLine := line.new(lineStart, displayTP3Price, lineEnd, displayTP3Price, color=tp3GlowColor, style=line.style_solid, width=7)
+
+        entryLine := line.new(lineStart, displayEntryPrice, lineEnd, displayEntryPrice, color=color.new(entryLineColor, 0), style=line.style_dotted, width=3, extend=extend.right)
+        slLine := line.new(lineStart, displaySLPrice, lineEnd, displaySLPrice, color=color.new(stopLineColor, 0), style=line.style_dotted, width=3, extend=extend.right)
+        tp1Line := line.new(lineStart, displayTP1Price, lineEnd, displayTP1Price, color=color.new(tp1LineColor, 0), style=line.style_dotted, width=3, extend=extend.right)
+        tp2Line := line.new(lineStart, displayTP2Price, lineEnd, displayTP2Price, color=color.new(tp2LineColor, 0), style=line.style_dotted, width=3, extend=extend.right)
+        tp3Line := line.new(lineStart, displayTP3Price, lineEnd, displayTP3Price, color=color.new(tp3LineColor, 0), style=line.style_dotted, width=3, extend=extend.right)
+
+        if showChartTags
+            entryTagLine := line.new(bar_index, displayEntryPrice, entryTagX, displayEntryPrice, color=color.new(entryLineColor, 30), style=line.style_solid, width=4)
+            slTagLine := line.new(bar_index, displaySLPrice, slTagX, displaySLPrice, color=color.new(stopLineColor, 30), style=line.style_solid, width=4)
+            tp1TagLine := line.new(tpConnectorX - 3, displayTP1Price, tpLabelX, displayTP1Price, color=color.new(tp1LineColor, 28), style=line.style_solid, width=4)
+            tp2TagLine := line.new(tpConnectorX - 2, displayTP2Price, tpLabelX, displayTP2Price, color=color.new(tp2LineColor, 28), style=line.style_solid, width=4)
+            tp3TagLine := line.new(tpConnectorX - 1, displayTP3Price, tpLabelX, displayTP3Price, color=color.new(tp3LineColor, 28), style=line.style_solid, width=4)
+
+            entryTagLbl := label.new(entryTagX, displayEntryPrice, "Entry : " + str.tostring(displayEntryPrice, priceFormat), color=color.new(entryLineColor, 0), textcolor=color.white, style=label.style_label_left, size=size.normal)
+            slTagLbl := label.new(slTagX, displaySLPrice, "Stop loss : " + str.tostring(displaySLPrice, priceFormat), color=color.new(stopLineColor, 0), textcolor=color.white, style=label.style_label_left, size=size.normal)
+            entryDotLbl := label.new(bar_index, displayEntryPrice, "", color=color.new(entryLineColor, 0), textcolor=color.white, style=label.style_circle, size=size.tiny)
+            slDotLbl := label.new(bar_index, displaySLPrice, "", color=color.new(stopLineColor, 0), textcolor=color.white, style=label.style_circle, size=size.tiny)
+            tp1DotLbl := label.new(tpConnectorX - 3, displayTP1Price, "", color=color.new(tp1LineColor, 0), textcolor=color.white, style=label.style_circle, size=size.tiny)
+            tp2DotLbl := label.new(tpConnectorX - 2, displayTP2Price, "", color=color.new(tp2LineColor, 0), textcolor=color.white, style=label.style_circle, size=size.tiny)
+            tp3DotLbl := label.new(tpConnectorX - 1, displayTP3Price, "", color=color.new(tp3LineColor, 0), textcolor=color.white, style=label.style_circle, size=size.tiny)
+
+        entryLbl := label.new(tpLabelX, displayEntryPrice, "Entry : " + str.tostring(displayEntryPrice, priceFormat), color=color.new(entryLineColor, 0), textcolor=color.white, style=label.style_label_left, size=size.normal)
+        slLbl := label.new(tpLabelX, displaySLPrice, "Stop loss : " + str.tostring(displaySLPrice, priceFormat), color=color.new(stopLineColor, 0), textcolor=color.white, style=label.style_label_left, size=size.normal)
+        tp1Lbl := label.new(tpLabelX, displayTP1Price, "Safe TP : " + str.tostring(displayTP1Price, priceFormat), color=color.new(tp1LineColor, 0), textcolor=color.white, style=label.style_label_left, size=size.normal)
+        tp2Lbl := label.new(tpLabelX, displayTP2Price, "TP 1 : " + str.tostring(displayTP2Price, priceFormat), color=color.new(tp2LineColor, 0), textcolor=color.white, style=label.style_label_left, size=size.normal)
+        tp3Lbl := label.new(tpLabelX, displayTP3Price, "TP 2 : " + str.tostring(displayTP3Price, priceFormat), color=color.new(tp3LineColor, 0), textcolor=color.white, style=label.style_label_left, size=size.normal)
+
+// Dashboard helpers
+f_tfTrend(tf) =>
+    emaFastTf = request.security(syminfo.tickerid, tf, ta.ema(close, emaFast), lookahead=barmerge.lookahead_off)
+    emaMidTf = request.security(syminfo.tickerid, tf, ta.ema(close, emaMid), lookahead=barmerge.lookahead_off)
+    closeTf = request.security(syminfo.tickerid, tf, close, lookahead=barmerge.lookahead_off)
+    closeTf > emaMidTf and emaFastTf > emaMidTf ? "Bullish" : closeTf < emaMidTf and emaFastTf < emaMidTf ? "Bearish" : "Mixed"
+
+f_trendColor(trendText) =>
+    trendText == "Bullish" ? colBull : trendText == "Bearish" ? colBear : colNeutral
+
+trend_1m = f_tfTrend("1")
+trend_5m = f_tfTrend("5")
+trend_15m = f_tfTrend("15")
+trend_1H = f_tfTrend("60")
+trend_2H = f_tfTrend("120")
+trend_4H = f_tfTrend("240")
+trend_12H = f_tfTrend("720")
+trend_1D = f_tfTrend("D")
+
+volaText = na(bbWidthBaseline) ? "Balanced" : bbWidthPct > bbWidthBaseline * 1.15 ? "Expanded" : bbWidthPct < bbWidthBaseline * minBBWidthRatio ? "Compressed" : "Balanced"
+volaColor = volaText == "Expanded" ? colBull : volaText == "Compressed" ? colWarn : colNeutral
+sessionFilterText = useSessionFilter ? (inTradingSession ? "Allowed" : "Blocked") : "Off"
+sessionFilterColor = useSessionFilter ? (inTradingSession ? colBull : colBear) : colNeutral
+htfText = htfBull ? "Bullish" : htfBear ? "Bearish" : "Mixed"
+htfColor = htfBull ? colBull : htfBear ? colBear : colNeutral
+
+var table dash = table.new(position.bottom_right, 4, 9, bgcolor=color.new(#111319, 5), border_width=1, border_color=color.new(#242B3B, 20), frame_width=1, frame_color=color.new(#1A1E29, 0))
+var table biasPanel = table.new(position.top_right, 3, 4, bgcolor=color.new(#10141D, 0), border_width=1, border_color=color.new(#2A3347, 18), frame_width=1, frame_color=color.new(#1A2231, 0))
+if barstate.isfirst
+    table.merge_cells(dash, 0, 0, 3, 0)
+    table.merge_cells(biasPanel, 0, 0, 2, 0)
+    table.merge_cells(biasPanel, 0, 3, 2, 3)
+
+if barstate.islast
+    if showNextBiasPanel
+        buyLightBg = nextBiasDir == 1 and nextBiasReady ? color.new(#1FD36B, 0) : nextBiasDir == 1 ? color.new(#1FD36B, 52) : color.new(#17311F, 78)
+        waitLightBg = nextBiasDir == 0 ? color.new(#8C98A8, 22) : not nextBiasReady ? color.new(#F2B544, 0) : color.new(#4D3B14, 76)
+        sellLightBg = nextBiasDir == -1 and nextBiasReady ? color.new(#FF6262, 0) : nextBiasDir == -1 ? color.new(#FF6262, 52) : color.new(#341A20, 78)
+        buyLightText = nextBiasDir == 1 and nextBiasReady ? "BUY" : nextBiasDir == 1 ? "WATCH" : "BUY"
+        waitLightText = nextBiasDir == 0 ? "WAIT" : not nextBiasReady ? "WATCH" : "READY"
+        sellLightText = nextBiasDir == -1 and nextBiasReady ? "SELL" : nextBiasDir == -1 ? "WATCH" : "SELL"
+        buyLightTextColor = nextBiasDir == 1 ? color.black : color.new(#9FB7A7, 8)
+        waitLightTextColor = nextBiasDir == 0 or not nextBiasReady ? color.black : color.new(#C7B28B, 10)
+        sellLightTextColor = nextBiasDir == -1 ? color.white : color.new(#C59BA5, 10)
+
+        table.cell(biasPanel, 0, 0, "NEXT BIAS", text_color=color.new(#D7DFEC, 0), text_size=size.small, text_halign=text.align_center, bgcolor=color.new(#0F141C, 0))
+        table.cell(biasPanel, 0, 1, buyLightText, text_color=buyLightTextColor, text_size=size.tiny, text_halign=text.align_center, bgcolor=buyLightBg)
+        table.cell(biasPanel, 1, 1, waitLightText, text_color=waitLightTextColor, text_size=size.tiny, text_halign=text.align_center, bgcolor=waitLightBg)
+        table.cell(biasPanel, 2, 1, sellLightText, text_color=sellLightTextColor, text_size=size.tiny, text_halign=text.align_center, bgcolor=sellLightBg)
+        table.cell(biasPanel, 0, 2, nextBiasText, text_color=nextBiasColor, text_size=size.small, text_halign=text.align_center, bgcolor=nextBiasBg)
+        table.cell(biasPanel, 1, 2, nextBiasDir == 1 ? str.tostring(buyTotal) + "/6" : nextBiasDir == -1 ? str.tostring(sellTotal) + "/6" : "--", text_color=color.white, text_size=size.small, text_halign=text.align_center, bgcolor=color.new(#111722, 0))
+        table.cell(biasPanel, 2, 2, nextBiasDir == 1 ? str.tostring(buyRR, "#.##") : nextBiasDir == -1 ? str.tostring(sellRR, "#.##") : "--", text_color=color.white, text_size=size.small, text_halign=text.align_center, bgcolor=color.new(#111722, 0))
+        table.cell(biasPanel, 0, 3, nextBiasDetail, text_color=color.white, text_size=size.tiny, text_halign=text.align_center, bgcolor=color.new(#111722, 0))
+    else
+        table.clear(biasPanel, 0, 0, 2, 3)
+
+    if showDash
+        headCol = color.new(#555555, 0)
+        rsiColor = rsiVal >= 50 ? colBull : colBear
+        profileColor = isSupported ? colBull : colWarn
+        adxColor = trendRegimeOk ? colBull : colWarn
+
+        table.cell(dash, 0, 0, "FXSniper Dashboard", text_color=colNeutral, text_size=size.small, text_halign=text.align_left)
+
+        table.cell(dash, 0, 1, "Profile", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 1, 1, marketProfile, text_color=profileColor, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 2, 1, "RSI", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 3, 1, str.tostring(rsiVal, "#.##"), text_color=rsiColor, text_size=size.tiny, text_halign=text.align_left)
+
+        table.cell(dash, 0, 2, "Volatility", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 1, 2, volaText, text_color=volaColor, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 2, 2, "ADX", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 3, 2, str.tostring(adxVal, "#.##"), text_color=adxColor, text_size=size.tiny, text_halign=text.align_left)
+
+        table.cell(dash, 0, 3, "Timeframe", text_color=headCol, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 1, 3, "Trend", text_color=headCol, text_size=size.tiny, text_halign=text.align_center)
+        table.cell(dash, 2, 3, "Timeframe", text_color=headCol, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 3, 3, "Trend", text_color=headCol, text_size=size.tiny, text_halign=text.align_center)
+
+        table.cell(dash, 0, 4, "1 Minute", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 1, 4, trend_1m, text_color=f_trendColor(trend_1m), text_size=size.tiny, text_halign=text.align_center)
+        table.cell(dash, 2, 4, "2 Hour", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 3, 4, trend_2H, text_color=f_trendColor(trend_2H), text_size=size.tiny, text_halign=text.align_center)
+
+        table.cell(dash, 0, 5, "5 Minute", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 1, 5, trend_5m, text_color=f_trendColor(trend_5m), text_size=size.tiny, text_halign=text.align_center)
+        table.cell(dash, 2, 5, "4 Hour", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 3, 5, trend_4H, text_color=f_trendColor(trend_4H), text_size=size.tiny, text_halign=text.align_center)
+
+        table.cell(dash, 0, 6, "15 Minute", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 1, 6, trend_15m, text_color=f_trendColor(trend_15m), text_size=size.tiny, text_halign=text.align_center)
+        table.cell(dash, 2, 6, "12 Hour", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 3, 6, trend_12H, text_color=f_trendColor(trend_12H), text_size=size.tiny, text_halign=text.align_center)
+
+        table.cell(dash, 0, 7, "1 Hour", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 1, 7, trend_1H, text_color=f_trendColor(trend_1H), text_size=size.tiny, text_halign=text.align_center)
+        table.cell(dash, 2, 7, "Daily", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 3, 7, trend_1D, text_color=f_trendColor(trend_1D), text_size=size.tiny, text_halign=text.align_center)
+
+        table.cell(dash, 0, 8, "HTF " + activeHtfLabel, text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 1, 8, htfText, text_color=htfColor, text_size=size.tiny, text_halign=text.align_center)
+        table.cell(dash, 2, 8, "Session", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 3, 8, sessionFilterText, text_color=sessionFilterColor, text_size=size.tiny, text_halign=text.align_center)
+    else
+        table.clear(dash, 0, 0, 3, 8)
+
+// Alerts
+alertcondition(buySignal, "FXSniper Buy", "FXSniper buy signal")
+alertcondition(sellSignal, "FXSniper Sell", "FXSniper sell signal")
+alertcondition(buySignalA, "FXSniper Buy A-Tier", "FXSniper A-tier buy signal")
+alertcondition(buySignalB, "FXSniper Buy B-Tier", "FXSniper B-tier buy signal")
+alertcondition(sellSignalA, "FXSniper Sell A-Tier", "FXSniper A-tier sell signal")
+alertcondition(sellSignalB, "FXSniper Sell B-Tier", "FXSniper B-tier sell signal")
+
+if buySignal
+    strengthLabel = buyStrength == 2 ? "A Smart Signal" : buyStrength == 1 ? "A Standard Signal" : "B Scout Signal"
+    scoreText = buySignalA ? str.tostring(buyTotal) + "/6 (A)" : str.tostring(buyAggressiveScore) + " (B adj)"
+    alertMsg = "[FXSniper] BUY " + pairName + " | " + strengthLabel + "\nConfluence: " + scoreText + "\nEntry: " + str.tostring(close, priceFormat) + "\nStop: " + str.tostring(slPrice, priceFormat) + "\nTP1: " + str.tostring(tp1Price, priceFormat) + "\nTP3: " + str.tostring(tp3Price, priceFormat) + "\nTarget: " + str.tostring(estTarget, priceFormat) + "\nEst. R:R = 1:" + str.tostring(rr, "#.##")
+    alert(alertMsg, alert.freq_once_per_bar_close)
+
+if sellSignal
+    strengthLabel = sellStrength == 2 ? "A Smart Signal" : sellStrength == 1 ? "A Standard Signal" : "B Scout Signal"
+    scoreText = sellSignalA ? str.tostring(sellTotal) + "/6 (A)" : str.tostring(sellAggressiveScore) + " (B adj)"
+    alertMsg = "[FXSniper] SELL " + pairName + " | " + strengthLabel + "\nConfluence: " + scoreText + "\nEntry: " + str.tostring(close, priceFormat) + "\nStop: " + str.tostring(slPrice, priceFormat) + "\nTP1: " + str.tostring(tp1Price, priceFormat) + "\nTP3: " + str.tostring(tp3Price, priceFormat) + "\nTarget: " + str.tostring(estTarget, priceFormat) + "\nEst. R:R = 1:" + str.tostring(rr, "#.##")
+    alert(alertMsg, alert.freq_once_per_bar_close)
