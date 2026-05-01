@@ -7,17 +7,18 @@ indicator("Forex Sniper v3", shorttitle="FXSniper3", overlay=true, max_labels_co
 
 // Market detection
 isXAUUSD = str.contains(str.upper(syminfo.ticker), "XAU") or str.contains(str.upper(syminfo.ticker), "GOLD")
-isEURUSD = str.contains(str.upper(syminfo.ticker), "EURUSD") or (str.contains(str.upper(syminfo.ticker), "EUR") and str.contains(str.upper(syminfo.ticker), "USD"))
-isSupported = isXAUUSD or isEURUSD
-marketProfile = isXAUUSD ? "Gold" : isEURUSD ? "EURUSD" : "Generic"
+isEURUSD = str.contains(str.upper(syminfo.ticker), "EURUSD") or (str.contains(str.upper(syminfo.ticker), "EUR") and str.contains(str.upper(syminfo.ticker), "USD") and not str.contains(str.upper(syminfo.ticker), "GBP"))
+isGBPUSD = str.contains(str.upper(syminfo.ticker), "GBPUSD") or (str.contains(str.upper(syminfo.ticker), "GBP") and str.contains(str.upper(syminfo.ticker), "USD"))
+isSupported = isXAUUSD or isEURUSD or isGBPUSD
+marketProfile = isXAUUSD ? "Gold" : isEURUSD ? "EURUSD" : isGBPUSD ? "GBPUSD" : "Generic"
 
 // Adaptive defaults
-atrMultSL = isXAUUSD ? 1.5 : 1.2
+atrMultSL = isXAUUSD ? 1.5 : isGBPUSD ? 1.3 : 1.2
 atrMultTP1 = 1.5
 atrMultTP2 = 2.0
 atrMultTP3 = 3.0
 priceFormat = isXAUUSD ? "#.##" : "#.#####"
-pairName = isXAUUSD ? "XAUUSD" : isEURUSD ? "EURUSD" : syminfo.ticker
+pairName = isXAUUSD ? "XAUUSD" : isEURUSD ? "EURUSD" : isGBPUSD ? "GBPUSD" : syminfo.ticker
 
 // Inputs
 grpTrend = "Trend"
@@ -769,4 +770,31 @@ if barstate.islast
         table.cell(dash, 3, 6, trend_12H, text_color=f_trendColor(trend_12H), text_size=size.tiny, text_halign=text.align_center)
 
         table.cell(dash, 0, 7, "1 Hour", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
-  
+        table.cell(dash, 1, 7, trend_1H, text_color=f_trendColor(trend_1H), text_size=size.tiny, text_halign=text.align_center)
+        table.cell(dash, 2, 7, "1 Day", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 3, 7, trend_1D, text_color=f_trendColor(trend_1D), text_size=size.tiny, text_halign=text.align_center)
+
+        table.cell(dash, 0, 8, "HTF (" + activeHtfLabel + ")", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 1, 8, htfText, text_color=htfColor, text_size=size.tiny, text_halign=text.align_center)
+        table.cell(dash, 2, 8, "Session Filter", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(dash, 3, 8, sessionFilterText, text_color=sessionFilterColor, text_size=size.tiny, text_halign=text.align_center)
+
+// ── Telegram Webhook / Alert messages ────────────────────────────────────────
+alertBuySL   = f_buyStop(close)
+alertBuyRisk = math.max(close - alertBuySL, syminfo.mintick)
+alertBuyTP1a = close + alertBuyRisk * atrMultTP1
+alertBuyTP2a = close + alertBuyRisk * atrMultTP2
+alertBuyTP3a = close + alertBuyRisk * atrMultTP3
+alertSellSL   = f_sellStop(close)
+alertSellRisk = math.max(alertSellSL - close, syminfo.mintick)
+alertSellTP1a = close - alertSellRisk * atrMultTP1
+alertSellTP2a = close - alertSellRisk * atrMultTP2
+alertSellTP3a = close - alertSellRisk * atrMultTP3
+buyTypeStr  = buyStrength == 2 ? "Smart Buy"  : buyStrength == 1 ? "Buy"  : "Scout Buy"
+sellTypeStr = sellStrength == 2 ? "Smart Sell" : sellStrength == 1 ? "Sell" : "Scout Sell"
+buyMsg  = '{"action":"BUY","symbol":"'  + pairName + '","type":"' + buyTypeStr  + '","entry":' + str.tostring(close, priceFormat) + ',"sl":' + str.tostring(alertBuySL, priceFormat)  + ',"tp1":' + str.tostring(alertBuyTP1a, priceFormat)  + ',"tp2":' + str.tostring(alertBuyTP2a, priceFormat)  + ',"tp3":' + str.tostring(alertBuyTP3a, priceFormat)  + ',"rr":"' + str.tostring(buyRR, "#.##")  + '","score":"' + str.tostring(buyTotal)  + '/6"}'
+sellMsg = '{"action":"SELL","symbol":"' + pairName + '","type":"' + sellTypeStr + '","entry":' + str.tostring(close, priceFormat) + ',"sl":' + str.tostring(alertSellSL, priceFormat) + ',"tp1":' + str.tostring(alertSellTP1a, priceFormat) + ',"tp2":' + str.tostring(alertSellTP2a, priceFormat) + ',"tp3":' + str.tostring(alertSellTP3a, priceFormat) + ',"rr":"' + str.tostring(sellRR, "#.##") + '","score":"' + str.tostring(sellTotal) + '/6"}'
+slHitMsg = '{"action":"SL_HIT","symbol":"' + pairName + '","direction":"' + (longStopped ? "LONG" : "SHORT") + '","entry":' + str.tostring(displayEntryPrice, priceFormat) + ',"sl":' + str.tostring(displaySLPrice, priceFormat) + '}'
+alertcondition(buySignal,                                               title="[FXSniper] BUY Signal",  message=buyMsg)
+alertcondition(sellSignal,                                              title="[FXSniper] SELL Signal", message=sellMsg)
+alertcondition((longStopped or shortStopped) and barstate.isconfirmed,  title="[FXSniper] SL Hit",      message=slHitMsg)
