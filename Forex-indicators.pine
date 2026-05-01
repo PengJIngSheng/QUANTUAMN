@@ -1,9 +1,9 @@
 // This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// Forex Sniper v2.1 - XAUUSD & EURUSD confluence signal engine
-// Trend-following pullback entries with higher-timeframe and structure filters
+// Forex Sniper v3.0 - XAUUSD & EURUSD confluence signal engine
+// Trend-following pullback entries with HTF filters + ORBF bonus + Telegram webhook
 
 //@version=6
-indicator("Forex Sniper v2", shorttitle="FXSniper2", overlay=true, max_labels_count=500, max_lines_count=500)
+indicator("Forex Sniper v3", shorttitle="FXSniper3", overlay=true, max_labels_count=500, max_lines_count=500)
 
 // Market detection
 isXAUUSD = str.contains(str.upper(syminfo.ticker), "XAU") or str.contains(str.upper(syminfo.ticker), "GOLD")
@@ -89,6 +89,10 @@ sessionEnd = input.int(0, "Session End (MYT)", minval=0, maxval=23, group=grpSes
 showSession = input.bool(true, "Highlight Custom Session", group=grpSession)
 showAllSess = input.bool(true, "Show Major Sessions", group=grpSession)
 
+grpORBF = "Opening Range Break Failure (ORBF)"
+useORBF    = input.bool(true,  "Enable ORBF Bonus",       group=grpORBF, tooltip="Detects London open breakout failures and gives +1 score bonus to the opposite direction.")
+showORBFBox = input.bool(true, "Show Opening Range Box",   group=grpORBF, tooltip="Draws a dashed box on the chart marking the London open range (08:00 UTC bar on M15).")
+
 grpColor = "Colors"
 colBull = input.color(#00E676, "Bullish Color", group=grpColor)
 colBear = input.color(#FF1744, "Bearish Color", group=grpColor)
@@ -160,6 +164,57 @@ if not na(swLow)
     recentSwLow := swLow
 if not na(swHigh)
     recentSwHigh := swHigh
+
+// === ORBF State Variables ===
+var float orbHigh       = na
+var float orbLow        = na
+var bool  orbBullBroke  = false
+var bool  orbBearBroke  = false
+var bool  orbfBullBonus = false   // Bear breakout failed  → Buy gets +1
+var bool  orbfBearBonus = false   // Bull breakout failed  → Sell gets +1
+var int   orbBarIdx     = na
+var box   orbBox        = na
+
+// === ORBF Calculation (optimised for M15) ===
+// London open = 08:00 UTC = 16:00 MYT
+// On M15: observation window = 2 bars (30 min), validity window = 3 bars (45 min)
+isLondonOpenBar = hour(time, "UTC") == 8 and minute(time, "UTC") == 0
+orbWindowBars   = 3   // 45-min validity on M15
+
+// Reset every London open
+if isLondonOpenBar
+    orbHigh        := high
+    orbLow         := low
+    orbBarIdx      := bar_index
+    orbBullBroke   := false
+    orbBearBroke   := false
+    orbfBullBonus  := false
+    orbfBearBonus  := false
+
+orbWindowActive = useORBF and not na(orbBarIdx) and bar_index <= orbBarIdx + orbWindowBars and not na(orbHigh)
+
+// Step 1 – detect initial breakout of the opening range
+if orbWindowActive and bar_index > orbBarIdx
+    if not orbBullBroke and close > orbHigh
+        orbBullBroke := true
+    if not orbBearBroke and close < orbLow
+        orbBearBroke := true
+
+// Step 2 – detect breakout failure (price returns inside the range)
+if orbWindowActive and bar_index > orbBarIdx
+    if orbBullBroke and close < orbHigh and close > orbLow
+        orbfBearBonus := true   // Upside breakout failed  → Sell signal gets +1
+    if orbBearBroke and close > orbLow  and close < orbHigh
+        orbfBullBonus := true   // Downside breakout failed → Buy signal gets +1
+
+// Draw opening range box on chart
+if showORBFBox and isLondonOpenBar and barstate.isconfirmed
+    box.delete(orbBox)
+    orbBox := box.new(bar_index, orbHigh, bar_index + orbWindowBars, orbLow,
+                      bgcolor       = color.new(#FFD740, 88),
+                      border_color  = color.new(#FFD740, 30),
+                      border_width  = 1,
+                      border_style  = line.style_dashed)
 
 plot(showEMA ? emaFastLine : na, "EMA Fast", color=color.new(#42A5F5, 20), linewidth=1)
 plot(showEMA ? emaMidLine : na, "EMA Mid", color=color.new(#FF9800, 20), linewidth=1)
@@ -254,8 +309,8 @@ sellCount += sell_c3 ? 1 : 0
 sellCount += sell_c4 ? 1 : 0
 sellCount += sell_c5 ? 1 : 0
 
-buyBonus = bullCandle ? 1 : 0
-sellBonus = bearCandle ? 1 : 0
+buyBonus  = (bullCandle ? 1 : 0) + (orbfBullBonus ? 1 : 0)   // candle pattern + ORBF bear-breakout-failure bonus
+sellBonus = (bearCandle ? 1 : 0) + (orbfBearBonus ? 1 : 0)   // candle pattern + ORBF bull-breakout-failure bonus
 buyEntryBonus = (reclaimTriggerLong or continuationTriggerLong) ? 1 : 0
 sellEntryBonus = (reclaimTriggerShort or continuationTriggerShort) ? 1 : 0
 
@@ -357,8 +412,9 @@ nextBiasDetail = nextBiasDir == 1 ? "Bull " + str.tostring(buyTotal) + "/6 | RR 
 
 strongBullPhase = htfBull and emaFastLine > emaMidLine and emaMidSlope > 0 and dmiBull
 strongBearPhase = htfBear and emaFastLine < emaMidLine and emaMidSlope < 0 and dmiBear
-activeBuyCooldownBars = useDynamicCooldown ? (strongBullPhase ? strongTrendCooldownBars : cooldownBars) : cooldownBars
-activeSellCooldownBars = useDynamicCooldown ? (strongBearPhase ? strongTrendCooldownBars : cooldownBars) : cooldownBars
+// ORBF active → compress cooldown to 1 bar so we don't miss the reversal entry
+activeBuyCooldownBars  = orbfBullBonus ? 1 : useDynamicCooldown ? (strongBullPhase ? strongTrendCooldownBars : cooldownBars) : cooldownBars
+activeSellCooldownBars = orbfBearBonus ? 1 : useDynamicCooldown ? (strongBearPhase ? strongTrendCooldownBars : cooldownBars) : cooldownBars
 buyCooldownOk = na(lastBuyBar) or bar_index - lastBuyBar > activeBuyCooldownBars
 sellCooldownOk = na(lastSellBar) or bar_index - lastSellBar > activeSellCooldownBars
 
@@ -713,33 +769,4 @@ if barstate.islast
         table.cell(dash, 3, 6, trend_12H, text_color=f_trendColor(trend_12H), text_size=size.tiny, text_halign=text.align_center)
 
         table.cell(dash, 0, 7, "1 Hour", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
-        table.cell(dash, 1, 7, trend_1H, text_color=f_trendColor(trend_1H), text_size=size.tiny, text_halign=text.align_center)
-        table.cell(dash, 2, 7, "Daily", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
-        table.cell(dash, 3, 7, trend_1D, text_color=f_trendColor(trend_1D), text_size=size.tiny, text_halign=text.align_center)
-
-        table.cell(dash, 0, 8, "HTF " + activeHtfLabel, text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
-        table.cell(dash, 1, 8, htfText, text_color=htfColor, text_size=size.tiny, text_halign=text.align_center)
-        table.cell(dash, 2, 8, "Session", text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
-        table.cell(dash, 3, 8, sessionFilterText, text_color=sessionFilterColor, text_size=size.tiny, text_halign=text.align_center)
-    else
-        table.clear(dash, 0, 0, 3, 8)
-
-// Alerts
-alertcondition(buySignal, "FXSniper Buy", "FXSniper buy signal")
-alertcondition(sellSignal, "FXSniper Sell", "FXSniper sell signal")
-alertcondition(buySignalA, "FXSniper Buy A-Tier", "FXSniper A-tier buy signal")
-alertcondition(buySignalB, "FXSniper Buy B-Tier", "FXSniper B-tier buy signal")
-alertcondition(sellSignalA, "FXSniper Sell A-Tier", "FXSniper A-tier sell signal")
-alertcondition(sellSignalB, "FXSniper Sell B-Tier", "FXSniper B-tier sell signal")
-
-if buySignal
-    strengthLabel = buyStrength == 2 ? "A Smart Signal" : buyStrength == 1 ? "A Standard Signal" : "B Scout Signal"
-    scoreText = buySignalA ? str.tostring(buyTotal) + "/6 (A)" : str.tostring(buyAggressiveScore) + " (B adj)"
-    alertMsg = "[FXSniper] BUY " + pairName + " | " + strengthLabel + "\nConfluence: " + scoreText + "\nEntry: " + str.tostring(close, priceFormat) + "\nStop: " + str.tostring(slPrice, priceFormat) + "\nTP1: " + str.tostring(tp1Price, priceFormat) + "\nTP3: " + str.tostring(tp3Price, priceFormat) + "\nTarget: " + str.tostring(estTarget, priceFormat) + "\nEst. R:R = 1:" + str.tostring(rr, "#.##")
-    alert(alertMsg, alert.freq_once_per_bar_close)
-
-if sellSignal
-    strengthLabel = sellStrength == 2 ? "A Smart Signal" : sellStrength == 1 ? "A Standard Signal" : "B Scout Signal"
-    scoreText = sellSignalA ? str.tostring(sellTotal) + "/6 (A)" : str.tostring(sellAggressiveScore) + " (B adj)"
-    alertMsg = "[FXSniper] SELL " + pairName + " | " + strengthLabel + "\nConfluence: " + scoreText + "\nEntry: " + str.tostring(close, priceFormat) + "\nStop: " + str.tostring(slPrice, priceFormat) + "\nTP1: " + str.tostring(tp1Price, priceFormat) + "\nTP3: " + str.tostring(tp3Price, priceFormat) + "\nTarget: " + str.tostring(estTarget, priceFormat) + "\nEst. R:R = 1:" + str.tostring(rr, "#.##")
-    alert(alertMsg, alert.freq_once_per_bar_close)
+  
